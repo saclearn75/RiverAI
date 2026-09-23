@@ -12,6 +12,7 @@ import os
 import re
 from pathlib import Path
 
+# Silences HF messages when downloading datasets/transformers packages.
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
@@ -56,7 +57,8 @@ LORA_RANK = int(os.getenv("LORA_RANK", "8"))
 LEARNING_RATE = float(os.getenv("LEARNING_RATE", "4e-5"))
 STOP_TOKEN = os.getenv("STOP_TOKEN", "<|im_end|>")
 EVAL_SEED_BASE = int(os.getenv("EVAL_SEED_BASE", "20260921"))
-RESULTS_PATH = REPO_ROOT / "results.json"
+RESULTS_DIR = REPO_ROOT / "LoRA-results"
+RESULTS_PATH = RESULTS_DIR / "results.json"
 
 
 # --- GSM8K answer scoring and engine-specific prompt rendering ------------
@@ -183,6 +185,8 @@ def print_example(label: str, example: dict[str, object]) -> None:
 
 
 def main() -> None:
+    # Keep local experiment artifacts together, regardless of the shell cwd.
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     client = river.Client(api_key=API_KEY)
     capabilities = client.get_capabilities()
     if ENGINE not in capabilities:
@@ -233,6 +237,8 @@ def main() -> None:
         )
         print("model_id:", model.model_id)
 
+        ## 1. Baseline evaluation
+
         print("\nBaseline evaluation (held-out test split; no weight updates):")
         baseline = evaluate(model, tokenizer, test_split, eval_indices)
         print_evaluation("Baseline", baseline)
@@ -252,6 +258,8 @@ def main() -> None:
             }
             if stop:
                 sample_args["stop"] = stop
+
+            # 2. Model Training 
             groups = model.sample(**sample_args)
             if len(groups) != len(prompts):
                 raise RuntimeError(f"Expected {len(prompts)} sampled groups, received {len(groups)}.")
@@ -262,8 +270,10 @@ def main() -> None:
             for train_index, tokens, samples, answer in zip(train_indices, prompt_tokens, groups, rows["answer"]):
                 if len(samples) != GROUP_SIZE:
                     raise RuntimeError(f"Train index {train_index} returned {len(samples)} samples, expected {GROUP_SIZE}.")
+
                 rewards = [reward(sample.text, answer) for sample in samples]
                 extracted = [extract_boxed(sample.text) for sample in samples]
+               
                 all_rewards.extend(rewards)
                 baseline_reward = sum(rewards) / len(rewards)
                 example = {
@@ -303,8 +313,11 @@ def main() -> None:
             optimizer_applied = False
             loss: float | None = None
             if train_data:
+                # 3. Use advantages and log probabilities to calculate loss and gradients 
                 result = model.forward_backward(train_data, loss_fn="importance_sampling")
                 loss = float(result.metrics["loss"])
+
+                # 4. Applies those gradients to the trainable LoRA weights
                 model.optim_step(lr=LEARNING_RATE, beta1=0.9, beta2=0.95, eps=1e-8)
                 optimizer_applied = True
 
@@ -334,6 +347,7 @@ def main() -> None:
         checkpoint = model.save_weights(CHECKPOINT_NAME, mode="inference")
         print("saved checkpoint:", checkpoint.path)
 
+        # 5. Post Training Evaluation. 
         print("\nPost-training evaluation (the same held-out test indices):")
         post_training = evaluate(model, tokenizer, test_split, eval_indices)
         print_evaluation("Post-training", post_training)

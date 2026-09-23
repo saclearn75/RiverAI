@@ -1,5 +1,7 @@
 .*
 !.gitignore
+!.env.example
 .rocketride/
 ignore/
 __pycache__/
+video/
